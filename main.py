@@ -1,3 +1,5 @@
+#CODIGO PARA CORRER EN LA PC (recibe los valores del arduino y ejecuta los calculos matematicos y la visualizacion de los graficos de las distintas señales y sus armonicas)
+
 import serial
 import threading
 import tkinter as tk
