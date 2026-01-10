@@ -1,5 +1,3 @@
-#CODIGO PARA CORRER EN LA PC (recibe los valores del arduino y ejecuta los calculos matematicos y la visualizacion de los graficos de las distintas señales y sus armonicas)
-
 import serial
 import threading
 import tkinter as tk
@@ -10,17 +8,61 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from collections import deque
 import numpy as np
 from scipy.signal import butter, lfilter
+import time
+import math
 
-# Configuracion
+# --- CONFIGURACIÓN ---
 SERIAL_PORT = 'COM4' 
 BAUD_RATE = 115200 
 BUFFER_SIZE = 512  
 FS = 1000          
 
+class MockSerial:
+    def __init__(self):
+        self.start_time = time.time()
+        print("--- MOCK SERIAL INICIADO ---")
+        print("Simulando señal de generador: Senoidal 50Hz +/- 6V")
+        
+    @property
+    def in_waiting(self):
+        return 1 # Siempre tiene datos disponibles
+        
+    def readline(self):
+        # Simula el tiempo real para genera la onda
+        t = time.time() - self.start_time
+        
+        # Generar señal teórica (-6V a 6V)
+        # Fundamental 50Hz + Armónica pequeña 150Hz
+        val_volts = 6.0 * math.sin(2 * math.pi * 50 * t) + \
+                    1.0 * math.sin(2 * math.pi * 150 * t)
+                    
+        # Limitar a rango físico del generador si fuera necesario, pero la matemática es ideal
+        
+        # Simular circuito de acondicionamiento (Hardware):
+        # 1. Divisor y Offset: V_pin = (V_gen / 3.0) + 2.5V
+        #    Si V_gen = -6V -> -2 + 2.5 = 0.5V
+        #    Si V_gen =  6V ->  2 + 2.5 = 4.5V
+        v_pin = (val_volts / 3.0) + 2.5
+        
+        # Ruido aleatorio pequeño
+        noise = np.random.normal(0, 0.02)
+        v_pin += noise
+        
+        # Convertir a ADC (0-1023 para 0-5V)
+        adc_val = int((v_pin / 5.0) * 1023)
+        
+        # Clampear entre 0 y 1023
+        adc_val = max(0, min(1023, adc_val))
+        
+        # Simular delay de transmisión serial (aprox 1kHz -> 1ms)
+        time.sleep(1/FS) 
+        
+        return f"{adc_val}\n".encode()
+
 class AppDSP:
     def __init__(self, master):
         self.master = master
-        self.master.title("Sistema DSP - Análisis de Señales Pro")
+        self.master.title("Sistema DSP - Análisis de Señales Pro (MOCK ACTIVE)")
         
         # 1. SOLUCIÓN CRÍTICA: Lock para evitar el crash (Race Condition)
         self.lock = threading.Lock()
@@ -29,14 +71,18 @@ class AppDSP:
         
         # Variables para el estado del filtro (Memoria)
         self.zi = None
-        self.last_filter_type = "None"
         
         self.setup_ui()
         
+        # Intentar conectar serial, si falla usar Mock
         try:
             self.ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.1)
-        except:
-            print("Error: No se encontró el puerto.")
+            print(f"Conectado a {SERIAL_PORT}")
+        except Exception as e:
+            print(f"Error Serial: {e}")
+            print("Iniciando modo Simulación (Mock)...")
+            self.ser = MockSerial()
+            self.master.title("Sistema DSP - MODO SIMULACIÓN")
             
     def setup_ui(self):
         controls = ttk.Frame(self.master, padding="10")
@@ -59,18 +105,20 @@ class AppDSP:
         # Gráfico Temporal
         self.line_raw, = self.ax1.plot([], [], label="Original (-6 a 6V)", color='blue', lw=1)
         self.line_filt, = self.ax1.plot([], [], label="Filtrada", color='red', lw=1.5)
-        self.ax1.set_ylim(-7, 7)
+        self.ax1.set_ylim(-8, 8) # Un poco mas de margen
         self.ax1.set_xlim(0, BUFFER_SIZE)
-        self.ax1.grid(True)
+        self.ax1.grid(True, linestyle='--', alpha=0.7)
         self.ax1.legend(loc='upper right')
+        self.ax1.set_ylabel("Voltaje (V)")
         
         # Gráfico FFT
         self.ax2.set_title("Espectro de Frecuencia (FFT)")
         self.line_fft, = self.ax2.plot([], [], color='green')
         self.ax2.set_xlim(0, FS/2) 
         # 4. SOLUCIÓN: Escala FFT fija para evitar que "baile"
-        self.ax2.set_ylim(0, 500) 
-        self.ax2.grid(True)
+        self.ax2.set_ylim(0, 400) 
+        self.ax2.grid(True, linestyle='--', alpha=0.7)
+        self.ax2.set_xlabel("Frecuencia (Hz)")
         
         self.canvas = FigureCanvasTkAgg(self.fig, master=self.master)
         self.canvas.get_tk_widget().pack(side=tk.BOTTOM, fill=tk.BOTH, expand=True)
@@ -105,6 +153,8 @@ class AppDSP:
             y_adc = np.array(self.data_raw)
         
         # Destraducción: Recuperamos señal de 12Vpp
+        # Hardware: (Vin_real / 3) + 2.5 = V_pin
+        # Software inv: (V_pin - 2.5) * 3 = Vin_real
         y = ((y_adc * 5.0 / 1023.0) - 2.5) * 3.0
         
         # 2. MEJORA DE FILTRO: lfilter sobre el buffer actual
@@ -122,20 +172,30 @@ class AppDSP:
 
         # 3. CÁLCULO DE FFT
         n = len(y)
-        yf = np.abs(np.fft.rfft(y - np.mean(y))) 
-        xf = np.fft.rfftfreq(n, 1/FS)
-        
-        # Detección de armónicas
-        idx = np.argsort(yf)[-3:][::-1]
-        txt = "Armónicas detectadas: "
-        for i in idx:
-            txt += f"| {xf[i]:.1f}Hz (A:{yf[i]:.1f}) "
-        self.armonicas_label.config(text=txt)
+        if n > 0:
+            yf = np.abs(np.fft.rfft(y - np.mean(y))) 
+            xf = np.fft.rfftfreq(n, 1/FS)
+            
+            # Detección de armónicas
+            # Filtramos indices con magnitud > 10 para ignorar ruido de piso
+            threshold = 10
+            peak_idxs = np.where(yf > threshold)[0]
+            
+            # Ordenamos por magnitud
+            sorted_peak_idxs = peak_idxs[np.argsort(yf[peak_idxs])][::-1]
+            
+            # Tomamos hasta 3
+            top_idxs = sorted_peak_idxs[:3]
+            
+            txt = "Armónicas detectadas: "
+            for i in top_idxs:
+                txt += f"| {xf[i]:.1f}Hz (A:{yf[i]:.1f}) "
+            self.armonicas_label.config(text=txt)
 
-        # ACTUALIZACIÓN DE LÍNEAS (Para blit=True)
-        self.line_raw.set_data(np.arange(n), y)
-        self.line_filt.set_data(np.arange(n), y_filt)
-        self.line_fft.set_data(xf, yf)
+            # ACTUALIZACIÓN DE LÍNEAS (Para blit=True)
+            self.line_raw.set_data(np.arange(n), y)
+            self.line_filt.set_data(np.arange(n), y_filt)
+            self.line_fft.set_data(xf, yf)
         
         # 3. SOLUCIÓN: No llamamos a canvas.draw(), retornamos artistas
         return self.line_raw, self.line_filt, self.line_fft
