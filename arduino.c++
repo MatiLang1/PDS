@@ -10,21 +10,28 @@ void setup() {
 }
 
 void loop() {
-  // 1. MUESTREO (Entrada - 10 bits: 0-1023)
-  int sensorValue = analogRead(A0); 
 
-  // 2. TRATAMIENTO DIGITAL (Escalado de 10 bits a 8 bits: 0-255)
-  // Dividimos por 4 para que el valor entre en los 8 bits del R-2R
-  byte salida8bits = sensorValue / 4; 
+  // ENTRADA ANALOGICA
+  // Entrada - Muestreo (leemos el voltaje del pin A0), el ADC es de 10 bits por lo q el A0 tendra valores de 0-1023
+  int sensorValue = analogRead(A0) / 4; 
 
-  // 3. REPRESENTACIÓN EN TIEMPO REAL (Salida TP2)
-  // Enviamos el valor bit a bit a los pines digitales
-  PORTD = (salida8bits << 2); // Truco de programación rápida para pines 2 al 7
-  digitalWrite(8, bitRead(salida8bits, 6)); 
-  digitalWrite(9, bitRead(salida8bits, 7));
+  // Comunicacion Serie (Envio de datos a PC - para Python y FFT)
+  // Aca enviamos el valor original leido en el A0 (que es el valor de la señal original), es de 10 bits
+  Serial.println(sensorValue);
+// 1111000000 
 
-  // 4. ENVÍO A PC (Para Python / FFT)
-  Serial.println(sensorValue); 
+  // RECIBIMOS DATO FILTRADO DE LA PC (Si está disponible) y actualizamos el DAC
+  if (Serial.available() > 0) {
+    byte salida8bits = Serial.read(); // Leemos el byte que envió Python (0-255)
+    // byte salida8bits = sensorValue;
+    
+    // REPRESENTACIÓN EN TIEMPO REAL PARA EL OSCILOSCOPIO
+    // Enviamos en paralelo el valor de la señal bit a bit a los pines digitales (2-9)
+    PORTD = salida8bits << 2;
+    // digitalWrite(8, bitRead(salida8bits, 6)); 
+    // digitalWrite(9, bitRead(salida8bits, 7));
+    PORTB = salida8bits >> 6;
+  }
 
-  delayMicroseconds(1000); // Muestreo de 1kHz
+//   delayMicroseconds(1000); // Muestreo de 1kHz (delay de 1000 uS - 1 ms)
 }
