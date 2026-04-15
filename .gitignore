@@ -12,3 +12,10 @@ __pycache__/
 
 # Matplotlib cache
 .matplotlib/
+
+# Aclaraciones y TO_DO
+*.txt
+*.docx
+*.md
+*.pdf
+
