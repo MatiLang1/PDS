@@ -22,7 +22,7 @@ except Exception:
     pass
 
 # --- CONFIGURACIÓN ---
-SERIAL_PORT = 'COM3' 
+SERIAL_PORT = 'COM4'
 BAUD_RATE = 115200 
 BUFFER_SIZE = 512  
 FS = 1000          
@@ -87,7 +87,7 @@ class MockSerial:
 class AppDSP:
     def __init__(self, master):
         self.master = master
-        self.master.title("Sistema DSP - Análisis de Señales Pro (MOCK ACTIVE)")
+        self.master.title("Sistema DSP - Análisis de Señales")
         
         # Lock para bloquear la modificacion de la propiedad data_raw (hay 2 hilos modificando dicha propiedad, por lo q bloqueamos cuando uno la usa)
         self.lock = threading.Lock()
@@ -114,8 +114,10 @@ class AppDSP:
         
         self.setup_ui()
         
-        # Conexión Forzosa (Sin Mock) - Si falla, te mostrará el error exacto en la terminal
-        self.ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.1)
+        # --- MODO DE CONEXIÓN — descomentar solo una línea ---
+        self.ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.1)  # LAB REAL
+        # self.ser = MockSerial('square')  # TEST: onda cuadrada 50Hz ±6V (con armónicas)
+        # self.ser = MockSerial('sine')    # TEST: senoidal pura  50Hz ±6V (sin armónicas)
         print(f"Conectado a {SERIAL_PORT} Exitosamente!")
             
     def setup_ui(self):
@@ -168,12 +170,17 @@ class AppDSP:
     def start(self):
         if not self.running:
             self.running = True
+            # Limpiar buffer acumulado antes de arrancar — evita que Python
+            # mida fs_real inflada al drenar datos viejos del buffer serial.
+            if hasattr(self.ser, 'reset_input_buffer'):
+                self.ser.reset_input_buffer()
             # Reiniciar la medición de Fs real al arrancar
             self._sample_count = 0
             self._fs_timer = time.time()
             threading.Thread(target=self.read_serial, daemon=True).start()
             # blit=False para que ax2.cla() + redibujo de barras FFT funcione sin artefactos
-            self.ani = FuncAnimation(self.fig, self.animate, interval=50, blit=False)
+            self.ani = FuncAnimation(self.fig, self.animate, interval=50, blit=False,
+                                         cache_frame_data=False)
             self.canvas.draw()
 
     def stop(self):
@@ -182,80 +189,81 @@ class AppDSP:
             self.ani.event_source.stop()
 
     def read_serial(self):
+        # Sin guard `in_waiting > 0`: readline() bloquea a nivel OS (timeout 100ms
+        # en el Serial), libera el GIL durante el I/O y deja respirar a matplotlib.
+        # El guard viejo provocaba busy-spin en Windows (USB CDC no reporta bytes
+        # inmediatamente en in_waiting) → fs_real caía a 27-82 Hz por starvation.
         while self.running:
-            if self.ser.in_waiting > 0:
-                try:
-                    line = self.ser.readline().decode().strip()
-                    if line.isdigit():
-                        val_raw = int(line)
-                        # Convertir inmediatamente a dominio de voltaje (-6V a 6V)
-                        val_volts = 6.0 - (val_raw / 255.0) * 12.0
+            try:
+                line = self.ser.readline().decode(errors='ignore').strip()
+                if not line.isdigit():
+                    continue
+                val_raw = int(line)
+                # Dominio de voltaje (-6V a 6V). Inversión por el AmpOp:
+                # raw=0 → +6V, raw=255 → -6V.
+                val_volts = 6.0 - (val_raw / 255.0) * 12.0
 
-                        # Proceso de filtrado en tiempo real en Voltios
-                        f_type = self.filter_type.get()
-                        out_val_volts = val_volts
+                # Filtrado IIR en tiempo real, muestra a muestra, con estado persistente.
+                f_type = self.filter_type.get()
+                out_val_volts = val_volts
 
-                        if f_type != "None":
-                            fc1 = self.fc_low.get()
-                            fc2 = self.fc_high.get()
-                            # Recomputar coeficientes si cambió el tipo, fc o si Fs real se corrió > 5 Hz
-                            fs_changed = abs(self.fs_real - self.last_fs_real) > 5.0
-                            if (f_type != self.last_filter_type or fc1 != self.last_fc_low
-                                    or fc2 != self.last_fc_high or fs_changed):
-                                self.last_filter_type = f_type
-                                self.last_fc_low = fc1
-                                self.last_fc_high = fc2
-                                self.last_fs_real = self.fs_real
-                                nyq = 0.5 * self.fs_real
-                                fc1_safe = max(1.0, min(fc1, nyq - 1))
-                                fc2_safe = max(fc1_safe + 1.0, min(fc2, nyq - 1))
-                                if f_type == "Lowpass": b, a = butter(4, fc1_safe/nyq, btype='low')
-                                elif f_type == "Highpass": b, a = butter(4, fc1_safe/nyq, btype='high')
-                                else: b, a = butter(4, [fc1_safe/nyq, fc2_safe/nyq], btype='band')
-                                self.b, self.a = b, a
-                                self.zi = lfilter_zi(b, a) * val_volts
-
-                            if self.zi is not None:
-                                filtered_arr, self.zi = lfilter(self.b, self.a, [val_volts], zi=self.zi)
-                                out_val_volts = float(filtered_arr[0])
+                if f_type != "None":
+                    fc1 = self.fc_low.get()
+                    fc2 = self.fc_high.get()
+                    # Recomputar coeficientes si cambió el tipo, fc, o si Fs se corrió > 5 Hz
+                    fs_changed = abs(self.fs_real - self.last_fs_real) > 5.0
+                    if (f_type != self.last_filter_type or fc1 != self.last_fc_low
+                            or fc2 != self.last_fc_high or fs_changed):
+                        self.last_filter_type = f_type
+                        self.last_fc_low = fc1
+                        self.last_fc_high = fc2
+                        self.last_fs_real = self.fs_real
+                        nyq = 0.5 * self.fs_real
+                        fc1_safe = max(1.0, min(fc1, nyq - 1))
+                        fc2_safe = max(fc1_safe + 1.0, min(fc2, nyq - 1))
+                        if f_type == "Lowpass":
+                            b, a = butter(4, fc1_safe / nyq, btype='low')
+                        elif f_type == "Highpass":
+                            b, a = butter(4, fc1_safe / nyq, btype='high')
                         else:
-                            self.last_filter_type = "None"
-                            self.zi = None
+                            b, a = butter(4, [fc1_safe / nyq, fc2_safe / nyq], btype='band')
+                        self.b, self.a = b, a
+                        self.zi = lfilter_zi(b, a) * val_volts
 
-                        # Guardar en ambos buffers bajo el mismo lock — lo que se grafica
-                        # como "Filtrada" es exactamente lo que sale por el DAC.
-                        with self.lock:
-                            self.data_raw.append(val_volts)
-                            self.data_filt.append(out_val_volts)
+                    if self.zi is not None:
+                        filtered_arr, self.zi = lfilter(self.b, self.a, [val_volts], zi=self.zi)
+                        out_val_volts = float(filtered_arr[0])
+                else:
+                    self.last_filter_type = "None"
+                    self.zi = None
 
-                        # Medición de Fs real (cada ~200 muestras).
-                        # Clampeamos a un rango sensato para que ráfagas de
-                        # catchup o stalls del GIL no corrompan el eje FFT.
-                        self._sample_count += 1
-                        if self._sample_count >= 200:
-                            now = time.time()
-                            elapsed = now - self._fs_timer
-                            if elapsed > 0:
-                                measured = self._sample_count / elapsed
-                                if 200.0 <= measured <= 10000.0:
-                                    self.fs_real = measured
-                                    print(f"[read_serial] fs_real actualizado -> {measured:.1f} Hz (200 muestras en {elapsed*1000:.1f} ms)")
-                                else:
-                                    print(f"[read_serial] fs medida FUERA DE RANGO: {measured:.1f} Hz (descartada, se mantiene {self.fs_real:.1f} Hz)")
-                            self._sample_count = 0
-                            self._fs_timer = now
+                # Buffers bajo el mismo lock → raw y filtrada quedan alineadas por índice.
+                with self.lock:
+                    self.data_raw.append(val_volts)
+                    self.data_filt.append(out_val_volts)
 
-                        # Reconvertir de Voltios a byte crudo (0-255) para el DAC
-                        out_val_raw = ((6.0 - out_val_volts) / 12.0) * 255.0
+                # Medición de Fs real cada ~200 muestras. Clamp para que ráfagas
+                # de catchup o stalls del GIL no corrompan el eje de FFT.
+                self._sample_count += 1
+                if self._sample_count >= 200:
+                    now = time.time()
+                    elapsed = now - self._fs_timer
+                    if elapsed > 0:
+                        measured = self._sample_count / elapsed
+                        if 200.0 <= measured <= 10000.0:
+                            self.fs_real = measured
+                            print(f"[read_serial] fs_real -> {measured:.1f} Hz (200 muestras en {elapsed*1000:.1f} ms)")
+                        else:
+                            print(f"[read_serial] fs FUERA DE RANGO: {measured:.1f} Hz (descartada, se mantiene {self.fs_real:.1f} Hz)")
+                    self._sample_count = 0
+                    self._fs_timer = now
 
-                        # Limitar al rango de 8 bits [0, 255]
-                        out_val_raw = max(0, min(255, int(out_val_raw)))
-                        byte_val = out_val_raw
-
-                        # Enviar byte filtrado al Arduino
-                        self.ser.write(bytes([byte_val]))
-                except Exception as e:
-                    print(f"[read_serial] {repr(e)}")
+                # Reconvertir a byte crudo para el DAC y enviar al Arduino.
+                out_val_raw = ((6.0 - out_val_volts) / 12.0) * 255.0
+                out_val_raw = max(0, min(255, int(out_val_raw)))
+                self.ser.write(bytes([out_val_raw]))
+            except Exception as e:
+                print(f"[read_serial] {repr(e)}")
 
     def animate(self, frame):
         # Lock al leer AMBOS buffers para que raw y filtrada queden alineadas
@@ -269,12 +277,15 @@ class AppDSP:
         self._debug_counter += 1
         if self._debug_counter >= 20:
             self._debug_counter = 0
-            y_no_zero = y[y != 0]
-            n_nozero = len(y_no_zero)
-            y_min = float(np.min(y_no_zero)) if n_nozero > 0 else 0
-            y_max = float(np.max(y_no_zero)) if n_nozero > 0 else 0
-            print(f"[animate] n={len(y)} | muestras_no_cero={n_nozero} | "
-                  f"rango=[{y_min:.2f}, {y_max:.2f}] V | fs_real={self.fs_real:.1f}")
+            y_nz = y[y != 0]
+            y_min = float(np.min(y_nz)) if len(y_nz) > 0 else 0
+            y_max = float(np.max(y_nz)) if len(y_nz) > 0 else 0
+            # Convertir voltios de vuelta a raw para ver qué manda el Arduino
+            raw_min = int((6.0 - y_max) / 12.0 * 255)
+            raw_max = int((6.0 - y_min) / 12.0 * 255)
+            print(f"[debug] fs={self.fs_real:.0f}Hz | "
+                  f"raw Arduino: {raw_min}–{raw_max} (0=+6V, 255=-6V) | "
+                  f"voltios: [{y_min:.2f}, {y_max:.2f}] V")
 
         # Ignorar los primeros 256 puntos para evitar artefactos de inicialización
         # (al arrancar el buffer está lleno de ceros, que distorsionan la FFT)
@@ -355,6 +366,11 @@ class AppDSP:
             self.line_filt.set_data(t_ms, y_filt)
             if t_ms[-1] > 0:
                 self.ax1.set_xlim(0, t_ms[-1])
+            # Ajustar eje Y al rango real de la señal (con margen del 20%)
+            sig_min = float(np.min(y))
+            sig_max = float(np.max(y))
+            margin = max(0.5, (sig_max - sig_min) * 0.2)
+            self.ax1.set_ylim(sig_min - margin, sig_max + margin)
 
         return self.line_raw, self.line_filt
 
