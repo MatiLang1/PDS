@@ -1,5 +1,6 @@
 import serial
 import threading
+import queue
 import tkinter as tk
 from tkinter import ttk
 import matplotlib.pyplot as plt
@@ -23,24 +24,25 @@ except Exception:
 
 # --- CONFIGURACIÓN ---
 SERIAL_PORT = 'COM4'
-BAUD_RATE = 115200 
-BUFFER_SIZE = 512  
-FS = 1000          
+BAUD_RATE = 115200
+BUFFER_SIZE = 512
+FS = 1000
+DAC_ENABLE = True  # True para lab real con Arduino; False con mock_generador.py (evita rebote por par virtual)
 
 class MockSerial:
-    # signal: 'square' → onda cuadrada ±6V 50Hz (con armónicas)
-    #         'sine'   → senoidal pura  ±6V 50Hz (sin armónicas)
-    def __init__(self, signal='square'):
+    # signal: 'square' → onda cuadrada ±6V (con armónicas impares)
+    #         'sine'   → senoidal pura  ±6V (sin armónicas)
+    # freq:   frecuencia de la señal en Hz (default 50)
+    def __init__(self, signal='square', freq=50.0):
         self.signal = signal
+        self.freq = float(freq)
         # start_time se resetea en la primera llamada a readline() para no
         # acumular "deuda temporal" entre creación del mock y click en INICIAR
         self.start_time = None
         self.samples_sent = 0
         print("--- MOCK SERIAL INICIADO ---")
-        if signal == 'sine':
-            print("Simulando señal: senoidal pura 50Hz ±6V (sin armónicas)")
-        else:
-            print("Simulando señal: onda cuadrada 50Hz ±6V (con armónicas impares)")
+        tipo = "senoidal pura" if signal == 'sine' else "onda cuadrada"
+        print(f"Simulando señal: {tipo} {self.freq:.1f}Hz ±6V")
 
     @property
     def in_waiting(self):
@@ -69,12 +71,11 @@ class MockSerial:
         self.samples_sent += 1
 
         if self.signal == 'sine':
-            # Senoidal pura ±6V a 50 Hz — sin armónicas, solo F₀ en el espectro
-            val_volts = 6.0 * math.sin(2 * math.pi * 50 * t)
+            # Senoidal pura ±6V — solo F₀ en el espectro
+            val_volts = 6.0 * math.sin(2 * math.pi * self.freq * t)
         else:
-            # Onda cuadrada ±6V a 50 Hz — armónicas impares: 50, 150, 250 Hz...
-            # Amplitudes teóricas: 4A/π ≈ 7.64V, 4A/(3π) ≈ 2.55V, 4A/(5π) ≈ 1.53V
-            val_volts = 6.0 if math.sin(2 * math.pi * 50 * t) >= 0 else -6.0
+            # Onda cuadrada ±6V — armónicas impares en F, 3F, 5F, ...
+            val_volts = 6.0 if math.sin(2 * math.pi * self.freq * t) >= 0 else -6.0
                     
         # Empaquetado según tu nuevo protocolo: 0 = 6V, 255 = -6V
         adc_val = int(((6.0 - val_volts) / 12.0) * 255.0)
@@ -111,13 +112,25 @@ class AppDSP:
         self.last_fc_low = 0
         self.last_fc_high = 0
         self.last_fs_real = self.fs_real
-        
+        # Caché de los valores de los widgets Tk — leídos por animate (en main
+        # thread) y consumidos por read_serial (en thread). Evita .get() desde
+        # thread secundario, que bloquea esperando el main thread y puede tomar
+        # 50-80ms por llamada → mata la performance.
+        self._cached_filter_type = "None"
+        self._cached_fc_low = 40.0
+        self._cached_fc_high = 100.0
+
+        # Cola para el DAC: Thread A pone bytes acá (instantáneo), Thread B los
+        # escribe al puerto (puede bloquearse en USB sin afectar la lectura).
+        self.dac_queue = queue.Queue(maxsize=200)
+
         self.setup_ui()
         
         # --- MODO DE CONEXIÓN — descomentar solo una línea ---
         self.ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.1)  # LAB REAL
-        # self.ser = MockSerial('square')  # TEST: onda cuadrada 50Hz ±6V (con armónicas)
-        # self.ser = MockSerial('sine')    # TEST: senoidal pura  50Hz ±6V (sin armónicas)
+        # self.ser = MockSerial('sine', freq=400)    # TEST Nyquist: senoidal 400 Hz (bien representada)
+        # self.ser = MockSerial('sine', freq=550)    # TEST Nyquist: senoidal 550 Hz (aliasing → aparece a 450 Hz)
+        # self.ser = MockSerial('square', freq=50)  # TEST: cuadrada (con armónicas impares)
         print(f"Conectado a {SERIAL_PORT} Exitosamente!")
             
     def setup_ui(self):
@@ -177,7 +190,12 @@ class AppDSP:
             # Reiniciar la medición de Fs real al arrancar
             self._sample_count = 0
             self._fs_timer = time.time()
+            with self.lock:
+                self.data_raw = deque([0]*BUFFER_SIZE, maxlen=BUFFER_SIZE)
+                self.data_filt = deque([0]*BUFFER_SIZE, maxlen=BUFFER_SIZE)
             threading.Thread(target=self.read_serial, daemon=True).start()
+            if DAC_ENABLE:
+                threading.Thread(target=self.dac_writer, daemon=True).start()
             # blit=False para que ax2.cla() + redibujo de barras FFT funcione sin artefactos
             self.ani = FuncAnimation(self.fig, self.animate, interval=50, blit=False,
                                          cache_frame_data=False)
@@ -188,28 +206,65 @@ class AppDSP:
         if hasattr(self, 'ani'):
             self.ani.event_source.stop()
 
+    def dac_writer(self):
+        while self.running:
+            try:
+                byte = self.dac_queue.get(timeout=0.1)
+                self.ser.write(bytes([byte]))
+            except queue.Empty:
+                continue
+            except Exception as e:
+                print(f"[dac_writer] {repr(e)}")
+
     def read_serial(self):
         # Sin guard `in_waiting > 0`: readline() bloquea a nivel OS (timeout 100ms
         # en el Serial), libera el GIL durante el I/O y deja respirar a matplotlib.
         # El guard viejo provocaba busy-spin en Windows (USB CDC no reporta bytes
         # inmediatamente en in_waiting) → fs_real caía a 27-82 Hz por starvation.
+        # Limpiar buffer acumulado al arrancar el hilo
+        if hasattr(self.ser, 'reset_input_buffer'):
+            self.ser.reset_input_buffer()
+        # Track de cuándo descartamos por última vez para resincronizar
+        self._just_flushed = False
+        # Profiling acumulado por iteración para detectar el bottleneck real
+        t_acc = {'read': 0.0, 'parse': 0.0, 'filt': 0.0, 'lock': 0.0, 'write': 0.0}
+        n_iter = 0
+        _flushed_in_window = False  # flag para invalidar medición de Fs si hubo flush
         while self.running:
             try:
+                # Anti-atraso: si el buffer del SO acumula más de ~500 bytes
+                # (>~100 muestras = >100ms de retraso), Python se atrasó.
+                if hasattr(self.ser, 'in_waiting') and self.ser.in_waiting > 500:
+                    self.ser.reset_input_buffer()
+                    self._just_flushed = True
+                    _flushed_in_window = True
+                t0 = time.perf_counter()
                 line = self.ser.readline().decode(errors='ignore').strip()
+                t1 = time.perf_counter()
+                t_acc['read'] += (t1 - t0)
+                if self._just_flushed:
+                    self._just_flushed = False
+                    continue
                 if not line.isdigit():
                     continue
                 val_raw = int(line)
+                if not (0 <= val_raw <= 255):
+                    continue
+                t2 = time.perf_counter()
+                t_acc['parse'] += (t2 - t1)
                 # Dominio de voltaje (-6V a 6V). Inversión por el AmpOp:
                 # raw=0 → +6V, raw=255 → -6V.
                 val_volts = 6.0 - (val_raw / 255.0) * 12.0
 
                 # Filtrado IIR en tiempo real, muestra a muestra, con estado persistente.
-                f_type = self.filter_type.get()
+                # Usamos cache (actualizado por animate en main thread) para evitar
+                # .get() desde este thread, que bloquea esperando al main de Tk.
+                f_type = self._cached_filter_type
                 out_val_volts = val_volts
 
                 if f_type != "None":
-                    fc1 = self.fc_low.get()
-                    fc2 = self.fc_high.get()
+                    fc1 = self._cached_fc_low
+                    fc2 = self._cached_fc_high
                     # Recomputar coeficientes si cambió el tipo, fc, o si Fs se corrió > 5 Hz
                     fs_changed = abs(self.fs_real - self.last_fs_real) > 5.0
                     if (f_type != self.last_filter_type or fc1 != self.last_fc_low
@@ -237,55 +292,78 @@ class AppDSP:
                     self.last_filter_type = "None"
                     self.zi = None
 
+                t3 = time.perf_counter()
+                t_acc['filt'] += (t3 - t2)
+
                 # Buffers bajo el mismo lock → raw y filtrada quedan alineadas por índice.
                 with self.lock:
                     self.data_raw.append(val_volts)
                     self.data_filt.append(out_val_volts)
+                t4 = time.perf_counter()
+                t_acc['lock'] += (t4 - t3)
 
                 # Medición de Fs real cada ~200 muestras. Clamp para que ráfagas
                 # de catchup o stalls del GIL no corrompan el eje de FFT.
+                n_iter += 1
                 self._sample_count += 1
-                if self._sample_count >= 200:
+                if self._sample_count >= 100:
                     now = time.time()
                     elapsed = now - self._fs_timer
                     if elapsed > 0:
                         measured = self._sample_count / elapsed
-                        if 200.0 <= measured <= 10000.0:
+                        # Solo actualizar fs_real si no hubo flush en este intervalo
+                        # (un flush hace que 100 muestras lleguen en <50ms → Fs inflada)
+                        if 50.0 <= measured <= 10000.0 and not _flushed_in_window:
                             self.fs_real = measured
-                            print(f"[read_serial] fs_real -> {measured:.1f} Hz (200 muestras en {elapsed*1000:.1f} ms)")
-                        else:
-                            print(f"[read_serial] fs FUERA DE RANGO: {measured:.1f} Hz (descartada, se mantiene {self.fs_real:.1f} Hz)")
+                        in_w = self.ser.in_waiting if hasattr(self.ser, 'in_waiting') else -1
+                        # Promedios en ms por iteración
+                        if n_iter > 0:
+                            avg = {k: (v / n_iter) * 1000 for k, v in t_acc.items()}
+                            print(f"[fs] {measured:.0f} Hz | buf:{in_w}B | "
+                                  f"read:{avg['read']:.2f}ms parse:{avg['parse']:.2f}ms "
+                                  f"filt:{avg['filt']:.2f}ms lock:{avg['lock']:.2f}ms "
+                                  f"write:{avg['write']:.2f}ms")
+                        for k in t_acc:
+                            t_acc[k] = 0.0
+                        n_iter = 0
                     self._sample_count = 0
                     self._fs_timer = now
+                    _flushed_in_window = False
 
-                # Reconvertir a byte crudo para el DAC y enviar al Arduino.
-                out_val_raw = ((6.0 - out_val_volts) / 12.0) * 255.0
-                out_val_raw = max(0, min(255, int(out_val_raw)))
-                self.ser.write(bytes([out_val_raw]))
+                # Encolar byte para el DAC — instantáneo, no bloquea este thread.
+                # dac_writer() (thread separado) hace el write() al USB.
+                t5 = time.perf_counter()
+                if DAC_ENABLE:
+                    out_val_raw = ((6.0 - out_val_volts) / 12.0) * 255.0
+                    out_val_raw = max(0, min(255, int(out_val_raw)))
+                    try:
+                        self.dac_queue.put_nowait(out_val_raw)
+                    except queue.Full:
+                        pass  # cola llena = USB bloqueado; descartamos la muestra más nueva
+                t6 = time.perf_counter()
+                t_acc['write'] += (t6 - t5)
             except Exception as e:
                 print(f"[read_serial] {repr(e)}")
 
     def animate(self, frame):
+        # Refrescar el cache de las vars Tk (estamos en main thread, .get() no bloquea).
+        # read_serial usa estos valores cacheados para no bloquearse en .get() desde
+        # su thread secundario (donde cada .get() puede tardar 50-80ms).
+        self._cached_filter_type = self.filter_type.get()
+        self._cached_fc_low = self.fc_low.get()
+        self._cached_fc_high = self.fc_high.get()
+
         # Lock al leer AMBOS buffers para que raw y filtrada queden alineadas
         with self.lock:
             y = np.array(self.data_raw)
             y_filt = np.array(self.data_filt)
 
-        # DEBUG: cada ~20 frames (1 seg) imprimir stats del buffer
+        # Tracker simple para debug condicional (sin prints por defecto)
         if not hasattr(self, '_debug_counter'):
             self._debug_counter = 0
         self._debug_counter += 1
         if self._debug_counter >= 20:
             self._debug_counter = 0
-            y_nz = y[y != 0]
-            y_min = float(np.min(y_nz)) if len(y_nz) > 0 else 0
-            y_max = float(np.max(y_nz)) if len(y_nz) > 0 else 0
-            # Convertir voltios de vuelta a raw para ver qué manda el Arduino
-            raw_min = int((6.0 - y_max) / 12.0 * 255)
-            raw_max = int((6.0 - y_min) / 12.0 * 255)
-            print(f"[debug] fs={self.fs_real:.0f}Hz | "
-                  f"raw Arduino: {raw_min}–{raw_max} (0=+6V, 255=-6V) | "
-                  f"voltios: [{y_min:.2f}, {y_max:.2f}] V")
 
         # Ignorar los primeros 256 puntos para evitar artefactos de inicialización
         # (al arrancar el buffer está lleno de ceros, que distorsionan la FFT)
@@ -337,11 +415,6 @@ class AppDSP:
             self.ax2.set_xlabel("Frecuencia (Hz)")
             self.ax2.set_ylabel("Amplitud (V)")
             self.ax2.grid(True, linestyle='--', alpha=0.7)
-
-            # DEBUG: imprimir picos detectados cada ~20 frames
-            if self._debug_counter == 0 and top_idxs:
-                picos_str = ", ".join([f"{xf[i]:.1f}Hz@{yf[i]:.2f}V" for i in top_idxs])
-                print(f"[animate] picos detectados: {picos_str}")
 
             for rank, i in enumerate(top_idxs):
                 freq = xf[i]

@@ -14,10 +14,10 @@ void loop() {
   // Gate de timing: fuerza exactamente 1000 Hz de muestreo.
   // Sin esto el Arduino manda a ~2500 Hz, desborda el buffer serial y
   // Python lee muestras acumuladas → el eje de tiempo queda comprimido.
-  // += en vez de = evita que el error se acumule si el loop tarda más de 1ms.
+  // = micros() en vez de += 1000UL evita que el drift del UART acumule ciclos extras.
   static unsigned long ultimo = 0;
   if (micros() - ultimo < 1000UL) return;
-  ultimo += 1000UL;
+  ultimo = micros();
 
   // Muestreo: ADC 10-bit → 8-bit (0-255) para el protocolo serial
   int sensorValue = analogRead(A0) / 4;
